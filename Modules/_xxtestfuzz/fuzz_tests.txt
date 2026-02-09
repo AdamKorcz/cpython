@@ -9,3 +9,9 @@ fuzz_struct_unpack
 fuzz_ast_literal_eval
 fuzz_elementtree_parsewhole
 fuzz_pycompile
+fuzz_decode
+fuzz_crypto
+fuzz_dataops
+fuzz_textops
+fuzz_ioops
+fuzz_parsers

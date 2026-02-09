@@ -85,10 +85,14 @@ static int fuzz_builtin_unicode(const char* data, size_t size) {
 
 
 PyObject* struct_unpack_method = NULL;
+PyObject* struct_pack_method = NULL;
+PyObject* struct_calcsize_method = NULL;
+PyObject* struct_iter_unpack_method = NULL;
+PyObject* struct_unpack_from_method = NULL;
 PyObject* struct_error = NULL;
 /* Called by LLVMFuzzerTestOneInput for initialization */
 static int init_struct_unpack(void) {
-    /* Import struct.unpack */
+    /* Import struct module and methods */
     PyObject* struct_module = PyImport_ImportModule("struct");
     if (struct_module == NULL) {
         return 0;
@@ -98,48 +102,159 @@ static int init_struct_unpack(void) {
         return 0;
     }
     struct_unpack_method = PyObject_GetAttrString(struct_module, "unpack");
-    return struct_unpack_method != NULL;
+    if (struct_unpack_method == NULL) {
+        return 0;
+    }
+    struct_pack_method = PyObject_GetAttrString(struct_module, "pack");
+    if (struct_pack_method == NULL) {
+        return 0;
+    }
+    struct_calcsize_method = PyObject_GetAttrString(struct_module, "calcsize");
+    if (struct_calcsize_method == NULL) {
+        return 0;
+    }
+    struct_iter_unpack_method = PyObject_GetAttrString(struct_module, "iter_unpack");
+    if (struct_iter_unpack_method == NULL) {
+        return 0;
+    }
+    struct_unpack_from_method = PyObject_GetAttrString(struct_module, "unpack_from");
+    if (struct_unpack_from_method == NULL) {
+        return 0;
+    }
+    return 1;
 }
-/* Fuzz struct.unpack(x, y) */
+/* Clear common struct exceptions */
+static void clear_struct_errors(void) {
+    if (PyErr_Occurred()) {
+        if (PyErr_ExceptionMatches(PyExc_OverflowError) ||
+            PyErr_ExceptionMatches(PyExc_SystemError) ||
+            PyErr_ExceptionMatches(PyExc_MemoryError) ||
+            PyErr_ExceptionMatches(struct_error)) {
+            PyErr_Clear();
+        }
+    }
+}
+/* Fuzz struct module operations */
 static int fuzz_struct_unpack(const char* data, size_t size) {
-    /* Everything up to the first null byte is considered the
-       format. Everything after is the buffer */
+    /* Everything up to the first null byte is the format.
+       The byte after the null selects the operation.
+       Everything after that is the buffer. */
     const char* first_null = memchr(data, '\0', size);
     if (first_null == NULL) {
         return 0;
     }
 
     size_t format_length = first_null - data;
-    size_t buffer_length = size - format_length - 1;
+    const char* after_null = first_null + 1;
+    size_t remaining = size - format_length - 1;
+
+    /* Need at least 1 byte for operation selector */
+    unsigned char op = 0;
+    if (remaining > 0) {
+        op = (unsigned char)after_null[0] % 5;
+        after_null++;
+        remaining--;
+    }
 
     PyObject* pattern = PyBytes_FromStringAndSize(data, format_length);
     if (pattern == NULL) {
         return 0;
     }
-    PyObject* buffer = PyBytes_FromStringAndSize(first_null + 1, buffer_length);
+    PyObject* buffer = PyBytes_FromStringAndSize(after_null, remaining);
     if (buffer == NULL) {
         Py_DECREF(pattern);
         return 0;
     }
 
-    PyObject* unpacked = PyObject_CallFunctionObjArgs(
-        struct_unpack_method, pattern, buffer, NULL);
-    /* Ignore any overflow errors, these are easily triggered accidentally */
-    if (unpacked == NULL && PyErr_ExceptionMatches(PyExc_OverflowError)) {
-        PyErr_Clear();
-    }
-    /* The pascal format string will throw a negative size when passing 0
-       like: struct.unpack('0p', b'') */
-    if (unpacked == NULL && PyErr_ExceptionMatches(PyExc_SystemError)) {
-        PyErr_Clear();
-    }
-    /* Ignore any struct.error exceptions, these can be caused by invalid
-       formats or incomplete buffers both of which are common. */
-    if (unpacked == NULL && PyErr_ExceptionMatches(struct_error)) {
-        PyErr_Clear();
+    PyObject* result = NULL;
+
+    switch (op) {
+    case 0: /* unpack(fmt, buf) — original logic */
+        result = PyObject_CallFunctionObjArgs(
+            struct_unpack_method, pattern, buffer, NULL);
+        clear_struct_errors();
+        break;
+
+    case 1: /* calcsize(fmt) — exercises format parsing */
+        result = PyObject_CallOneArg(struct_calcsize_method, pattern);
+        clear_struct_errors();
+        break;
+
+    case 2: { /* pack(fmt, *values) — exercises pack handlers */
+        /* First compute the size, then unpack zeros to get the right
+           number of args with correct types, then pack those back */
+        PyObject* sz = PyObject_CallOneArg(struct_calcsize_method, pattern);
+        if (sz == NULL) {
+            clear_struct_errors();
+            break;
+        }
+        Py_ssize_t nbytes = PyLong_AsSsize_t(sz);
+        Py_DECREF(sz);
+        if (nbytes < 0 || nbytes > 65536) {
+            PyErr_Clear();
+            break;
+        }
+        /* Create a zero buffer of the right size */
+        PyObject* zeros = PyBytes_FromStringAndSize(NULL, nbytes);
+        if (zeros == NULL) break;
+        memset(PyBytes_AS_STRING(zeros), 0, nbytes);
+        /* Unpack zeros to get a tuple of default values */
+        PyObject* values = PyObject_CallFunctionObjArgs(
+            struct_unpack_method, pattern, zeros, NULL);
+        Py_DECREF(zeros);
+        if (values == NULL) {
+            clear_struct_errors();
+            break;
+        }
+        /* Build args tuple: (fmt, val0, val1, ...) */
+        Py_ssize_t nvals = PyTuple_GET_SIZE(values);
+        PyObject* pack_args = PyTuple_New(nvals + 1);
+        if (pack_args == NULL) {
+            Py_DECREF(values);
+            break;
+        }
+        Py_INCREF(pattern);
+        PyTuple_SET_ITEM(pack_args, 0, pattern);
+        for (Py_ssize_t i = 0; i < nvals; i++) {
+            PyObject* v = PyTuple_GET_ITEM(values, i);
+            Py_INCREF(v);
+            PyTuple_SET_ITEM(pack_args, i + 1, v);
+        }
+        Py_DECREF(values);
+        result = PyObject_Call(struct_pack_method, pack_args, NULL);
+        Py_DECREF(pack_args);
+        clear_struct_errors();
+        break;
     }
 
-    Py_XDECREF(unpacked);
+    case 3: { /* iter_unpack(fmt, buf) — exercises unpackiter */
+        PyObject* iter = PyObject_CallFunctionObjArgs(
+            struct_iter_unpack_method, pattern, buffer, NULL);
+        if (iter == NULL) {
+            clear_struct_errors();
+            break;
+        }
+        PyObject* item;
+        int count = 0;
+        while ((item = PyIter_Next(iter)) != NULL && count < 1000) {
+            Py_DECREF(item);
+            count++;
+        }
+        if (PyErr_Occurred()) {
+            clear_struct_errors();
+        }
+        Py_DECREF(iter);
+        break;
+    }
+
+    case 4: /* unpack_from(fmt, buf) — exercises offset handling */
+        result = PyObject_CallFunctionObjArgs(
+            struct_unpack_from_method, pattern, buffer, NULL);
+        clear_struct_errors();
+        break;
+    }
+
+    Py_XDECREF(result);
     Py_DECREF(pattern);
     Py_DECREF(buffer);
     return 0;
@@ -266,6 +381,31 @@ static int fuzz_sre_compile(const char* data, size_t size) {
         PyErr_Clear();
     }
 
+    /* If compilation succeeded, exercise the matching engine with the
+       pattern bytes themselves as match data.  This lets the fuzzer
+       discover compile+match combinations that trigger deep SRE paths. */
+    if (compiled != NULL) {
+        PyObject* match_result = PyObject_CallMethod(
+            compiled, "match", "O", pattern_bytes);
+        if (match_result == NULL) {
+            if (PyErr_ExceptionMatches(PyExc_RecursionError) ||
+                PyErr_ExceptionMatches(PyExc_OverflowError)) {
+                PyErr_Clear();
+            }
+        }
+        Py_XDECREF(match_result);
+
+        PyObject* search_result = PyObject_CallMethod(
+            compiled, "search", "O", pattern_bytes);
+        if (search_result == NULL) {
+            if (PyErr_ExceptionMatches(PyExc_RecursionError) ||
+                PyErr_ExceptionMatches(PyExc_OverflowError)) {
+                PyErr_Clear();
+            }
+        }
+        Py_XDECREF(search_result);
+    }
+
     Py_DECREF(pattern_bytes);
     Py_DECREF(flags_obj);
     Py_XDECREF(compiled);
@@ -276,12 +416,30 @@ static int fuzz_sre_compile(const char* data, size_t size) {
    Be careful not to add catostraphically slow regexes here, we want to
    exercise the matching code without causing timeouts.*/
 static const char* regex_patterns[] = {
+    /* basic patterns (original) */
     ".", "^", "abc", "abc|def", "^xxx$", "\\b", "()", "[a-zA-Z0-9]",
     "abc+", "[^A-Z]", "[x]", "(?=)", "a{z}", "a+b", "a*?", "a??", "a+?",
     "{}", "a{,}", "{", "}", "^\\(*\\d{3}\\)*( |-)*\\d{3}( |-)*\\d{4}$",
-    "(?:a*)*", "a{1,2}?"
+    "(?:a*)*", "a{1,2}?",
+    /* lookahead / lookbehind (ASSERT / ASSERT_NOT opcodes) */
+    "(?=abc)abc", "(?!xyz)...", "(?<=ab)c", "(?<!ab)c",
+    /* backreferences (GROUPREF opcode) */
+    "(a+)\\1", "(?P<name>a+)(?P=name)",
+    /* conditional backreference (GROUPREF_EXISTS) */
+    "(a)?(?(1)b|c)",
+    /* character categories (CATEGORY ops) */
+    "[\\w\\d\\s]+", "[\\W\\D\\S]+",
+    /* possessive / atomic (Python 3.11+) */
+    "(?>abc)", "a++b",
+    /* flag variants */
+    "(?m)^abc$", "(?s)a.b", "(?i)abc",
+    /* more complex patterns */
+    "(?:(?:a|b){2,4}c)+", "\\bfoo\\b.*\\bbar\\b",
+    "(a(b(c)d)e)", "a(?:b|c){1,3}?d",
 };
-const size_t NUM_PATTERNS = sizeof(regex_patterns) / sizeof(regex_patterns[0]);
+#define MAX_REGEX_PATTERNS \
+    (sizeof(regex_patterns) / sizeof(regex_patterns[0]))
+static size_t num_compiled_patterns = 0;
 PyObject** compiled_patterns = NULL;
 /* Called by LLVMFuzzerTestOneInput for initialization */
 static int init_sre_match(void) {
@@ -290,47 +448,80 @@ static int init_sre_match(void) {
         return 0;
     }
     compiled_patterns = (PyObject**) PyMem_RawMalloc(
-        sizeof(PyObject*) * NUM_PATTERNS);
+        sizeof(PyObject*) * MAX_REGEX_PATTERNS);
     if (compiled_patterns == NULL) {
         PyErr_NoMemory();
         return 0;
     }
 
-    /* Precompile all the regex patterns on the first run for faster fuzzing */
-    for (size_t i = 0; i < NUM_PATTERNS; i++) {
+    /* Precompile all the regex patterns on the first run for faster fuzzing.
+       Skip patterns that fail to compile (e.g. possessive quantifiers on
+       older Python versions) instead of aborting. */
+    num_compiled_patterns = 0;
+    for (size_t i = 0; i < MAX_REGEX_PATTERNS; i++) {
         PyObject* compiled = PyObject_CallMethod(
             re_module, "compile", "y", regex_patterns[i]);
-        /* Bail if any of the patterns fail to compile */
         if (compiled == NULL) {
-            return 0;
+            PyErr_Clear();
+            continue;
         }
-        compiled_patterns[i] = compiled;
+        compiled_patterns[num_compiled_patterns++] = compiled;
     }
-    return 1;
+    return num_compiled_patterns > 0;
 }
-/* Fuzz re.match(x) */
+
+/* SRE operation names for dispatching */
+static const char* sre_op_names[] = {
+    "match", "search", "findall", "fullmatch", "split", "sub"
+};
+#define NUM_SRE_OPS 6
+
+/* Fuzz re pattern operations */
 static int fuzz_sre_match(const char* data, size_t size) {
-    if (size < 1 || size > MAX_RE_TEST_SIZE) {
+    if (size < 2 || size > MAX_RE_TEST_SIZE) {
         return 0;
     }
-    /* Use the first byte as a uint8_t specifying the index of the
-       regex to use */
-    unsigned char idx = (unsigned char) data[0];
-    idx = idx % NUM_PATTERNS;
+    /* Byte 0: pattern selector, Byte 1: operation selector */
+    unsigned char pat_idx = (unsigned char)data[0] % num_compiled_patterns;
+    unsigned char op_idx = (unsigned char)data[1] % NUM_SRE_OPS;
 
     /* Pull the string to match from the remaining bytes */
-    PyObject* to_match = PyBytes_FromStringAndSize(data + 1, size - 1);
+    PyObject* to_match = PyBytes_FromStringAndSize(data + 2, size - 2);
     if (to_match == NULL) {
         return 0;
     }
 
-    PyObject* pattern = compiled_patterns[idx];
-    PyObject* match_callable = PyObject_GetAttrString(pattern, "match");
+    PyObject* pattern = compiled_patterns[pat_idx];
+    PyObject* result = NULL;
 
-    PyObject* matches = PyObject_CallOneArg(match_callable, to_match);
+    if (op_idx == 5) {
+        /* sub(repl, string) — use empty bytes as replacement */
+        PyObject* repl = PyBytes_FromStringAndSize("", 0);
+        if (repl == NULL) {
+            Py_DECREF(to_match);
+            return 0;
+        }
+        result = PyObject_CallMethod(pattern, "sub", "OO", repl, to_match);
+        Py_DECREF(repl);
+    } else {
+        PyObject* callable = PyObject_GetAttrString(
+            pattern, sre_op_names[op_idx]);
+        if (callable == NULL) {
+            Py_DECREF(to_match);
+            return 0;
+        }
+        result = PyObject_CallOneArg(callable, to_match);
+        Py_DECREF(callable);
+    }
 
-    Py_XDECREF(matches);
-    Py_DECREF(match_callable);
+    if (result == NULL) {
+        if (PyErr_ExceptionMatches(PyExc_RecursionError) ||
+            PyErr_ExceptionMatches(PyExc_OverflowError)) {
+            PyErr_Clear();
+        }
+    }
+
+    Py_XDECREF(result);
     Py_DECREF(to_match);
     return 0;
 }
@@ -441,6 +632,7 @@ static int fuzz_ast_literal_eval(const char* data, size_t size) {
 #define MAX_ELEMENTTREE_PARSEWHOLE_TEST_SIZE 0x100000
 PyObject* xmlparser_type = NULL;
 PyObject* bytesio_type = NULL;
+PyObject* treebuilder_type = NULL;
 /* Called by LLVMFuzzerTestOneInput for initialization */
 static int init_elementtree_parsewhole(void) {
     PyObject* elementtree_module = PyImport_ImportModule("_elementtree");
@@ -448,11 +640,15 @@ static int init_elementtree_parsewhole(void) {
         return 0;
     }
     xmlparser_type = PyObject_GetAttrString(elementtree_module, "XMLParser");
-    Py_DECREF(elementtree_module);
     if (xmlparser_type == NULL) {
+        Py_DECREF(elementtree_module);
         return 0;
     }
-
+    treebuilder_type = PyObject_GetAttrString(elementtree_module, "TreeBuilder");
+    Py_DECREF(elementtree_module);
+    if (treebuilder_type == NULL) {
+        return 0;
+    }
 
     PyObject* io_module = PyImport_ImportModule("io");
     if (io_module == NULL) {
@@ -466,36 +662,167 @@ static int init_elementtree_parsewhole(void) {
 
     return 1;
 }
-/* Fuzz _elementtree.XMLParser._parse_whole(x) */
+
+/* Walk an Element tree to exercise accessor and search paths */
+static void walk_element_tree(PyObject* root) {
+    if (root == NULL || root == Py_None) return;
+
+    /* Access .tag, .text, .tail, .attrib */
+    PyObject* tag = PyObject_GetAttrString(root, "tag");
+    Py_XDECREF(tag);
+    PyObject* text = PyObject_GetAttrString(root, "text");
+    Py_XDECREF(text);
+    PyObject* tail = PyObject_GetAttrString(root, "tail");
+    Py_XDECREF(tail);
+    PyObject* attrib = PyObject_GetAttrString(root, "attrib");
+    Py_XDECREF(attrib);
+
+    /* len(root) */
+    Py_ssize_t n = PyObject_Length(root);
+    if (n < 0) { PyErr_Clear(); }
+
+    /* iter() — iterate children */
+    PyObject* iter = PyObject_CallMethod(root, "iter", NULL);
+    if (iter != NULL) {
+        PyObject* child;
+        int count = 0;
+        while ((child = PyIter_Next(iter)) != NULL && count < 100) {
+            Py_DECREF(child);
+            count++;
+        }
+        if (PyErr_Occurred()) PyErr_Clear();
+        Py_DECREF(iter);
+    } else {
+        PyErr_Clear();
+    }
+
+    /* find("*") and findall("*") */
+    PyObject* star = PyUnicode_FromString("*");
+    if (star != NULL) {
+        PyObject* found = PyObject_CallMethod(root, "find", "O", star);
+        Py_XDECREF(found);
+        if (PyErr_Occurred()) PyErr_Clear();
+        PyObject* found_all = PyObject_CallMethod(root, "findall", "O", star);
+        Py_XDECREF(found_all);
+        if (PyErr_Occurred()) PyErr_Clear();
+        Py_DECREF(star);
+    } else {
+        PyErr_Clear();
+    }
+}
+
+/* Fuzz _elementtree.XMLParser with multiple modes */
 static int fuzz_elementtree_parsewhole(const char* data, size_t size) {
-    if (size > MAX_ELEMENTTREE_PARSEWHOLE_TEST_SIZE) {
+    if (size < 1 || size > MAX_ELEMENTTREE_PARSEWHOLE_TEST_SIZE) {
         return 0;
     }
 
-    PyObject *input = PyObject_CallFunction(bytesio_type, "y#", data, (Py_ssize_t)size);
-    if (input == NULL) {
-        assert(PyErr_Occurred());
-        PyErr_Print();
-        abort();
-    }
+    /* Byte 0 selects mode */
+    unsigned char mode = (unsigned char)data[0] % 3;
+    const char* xml_data = data + 1;
+    size_t xml_size = size - 1;
 
-    PyObject *xmlparser_instance = PyObject_CallObject(xmlparser_type, NULL);
-    if (xmlparser_instance == NULL) {
-        assert(PyErr_Occurred());
-        PyErr_Print();
-        abort();
-    }
+    if (mode == 0) {
+        /* Mode 0: original _parse_whole (backward compatible) */
+        PyObject *input = PyObject_CallFunction(
+            bytesio_type, "y#", xml_data, (Py_ssize_t)xml_size);
+        if (input == NULL) { PyErr_Clear(); return 0; }
 
-    PyObject *result = PyObject_CallMethod(xmlparser_instance, "_parse_whole", "O", input);
-    if (result == NULL) {
-        /* Ignore exception here, which can be caused by invalid XML input */
-        PyErr_Clear();
+        PyObject *parser = PyObject_CallObject(xmlparser_type, NULL);
+        if (parser == NULL) { PyErr_Clear(); Py_DECREF(input); return 0; }
+
+        PyObject *result = PyObject_CallMethod(
+            parser, "_parse_whole", "O", input);
+        if (result == NULL) {
+            PyErr_Clear();
+        } else {
+            Py_DECREF(result);
+        }
+        Py_DECREF(parser);
+        Py_DECREF(input);
+
+    } else if (mode == 1) {
+        /* Mode 1: TreeBuilder with insert_comments=True, insert_pis=True */
+        PyObject *kwargs = PyDict_New();
+        if (kwargs == NULL) return 0;
+        PyDict_SetItemString(kwargs, "insert_comments", Py_True);
+        PyDict_SetItemString(kwargs, "insert_pis", Py_True);
+        PyObject *empty_args = PyTuple_New(0);
+        if (empty_args == NULL) { Py_DECREF(kwargs); return 0; }
+        PyObject *tb = PyObject_Call(treebuilder_type, empty_args, kwargs);
+        Py_DECREF(empty_args);
+        Py_DECREF(kwargs);
+        if (tb == NULL) { PyErr_Clear(); return 0; }
+
+        /* Create XMLParser with target=tb */
+        PyObject *parser_kwargs = PyDict_New();
+        if (parser_kwargs == NULL) { Py_DECREF(tb); return 0; }
+        PyDict_SetItemString(parser_kwargs, "target", tb);
+        PyObject *parser_args = PyTuple_New(0);
+        if (parser_args == NULL) {
+            Py_DECREF(parser_kwargs); Py_DECREF(tb); return 0;
+        }
+        PyObject *parser = PyObject_Call(
+            xmlparser_type, parser_args, parser_kwargs);
+        Py_DECREF(parser_args);
+        Py_DECREF(parser_kwargs);
+        if (parser == NULL) { Py_DECREF(tb); PyErr_Clear(); return 0; }
+
+        PyObject *input = PyObject_CallFunction(
+            bytesio_type, "y#", xml_data, (Py_ssize_t)xml_size);
+        if (input == NULL) {
+            PyErr_Clear(); Py_DECREF(parser); Py_DECREF(tb); return 0;
+        }
+        PyObject *result = PyObject_CallMethod(
+            parser, "_parse_whole", "O", input);
+        if (result == NULL) {
+            PyErr_Clear();
+        } else {
+            walk_element_tree(result);
+            Py_DECREF(result);
+        }
+        Py_DECREF(input);
+        Py_DECREF(parser);
+        Py_DECREF(tb);
+
     } else {
-        Py_DECREF(result);
-    }
+        /* Mode 2: incremental feed() in 2 chunks + close() + tree walk */
+        PyObject *parser = PyObject_CallObject(xmlparser_type, NULL);
+        if (parser == NULL) { PyErr_Clear(); return 0; }
 
-    Py_DECREF(xmlparser_instance);
-    Py_DECREF(input);
+        size_t mid = xml_size / 2;
+        PyObject *chunk1 = PyBytes_FromStringAndSize(xml_data, mid);
+        if (chunk1 == NULL) { Py_DECREF(parser); return 0; }
+        PyObject *r1 = PyObject_CallMethod(parser, "feed", "O", chunk1);
+        Py_DECREF(chunk1);
+        if (r1 == NULL) {
+            PyErr_Clear();
+            Py_DECREF(parser);
+            return 0;
+        }
+        Py_DECREF(r1);
+
+        PyObject *chunk2 = PyBytes_FromStringAndSize(
+            xml_data + mid, xml_size - mid);
+        if (chunk2 == NULL) { Py_DECREF(parser); return 0; }
+        PyObject *r2 = PyObject_CallMethod(parser, "feed", "O", chunk2);
+        Py_DECREF(chunk2);
+        if (r2 == NULL) {
+            PyErr_Clear();
+            Py_DECREF(parser);
+            return 0;
+        }
+        Py_DECREF(r2);
+
+        PyObject *root = PyObject_CallMethod(parser, "close", NULL);
+        if (root == NULL) {
+            PyErr_Clear();
+        } else {
+            walk_element_tree(root);
+            Py_DECREF(root);
+        }
+        Py_DECREF(parser);
+    }
 
     return 0;
 }
@@ -607,6 +934,22 @@ fail:
     Py_ExitStatusException(status);
 }
 
+/* Dispatch macros for LLVMFuzzerTestOneInput.  FUZZ_TARGET handles
+   lazy init + run; FUZZ_TARGET_NO_INIT handles targets that need no
+   initialization step. */
+#define FUZZ_TARGET(name, init_func)                                        \
+    do {                                                                    \
+        static int _initialized = 0;                                        \
+        if (!_initialized) {                                                \
+            if (!init_func()) { PyErr_Print(); abort(); }                   \
+            _initialized = 1;                                               \
+        }                                                                   \
+        rv |= _run_fuzz(data, size, fuzz_##name);                           \
+    } while (0)
+
+#define FUZZ_TARGET_NO_INIT(name)                                           \
+    rv |= _run_fuzz(data, size, fuzz_##name)
+
 /* Fuzz test interface.
    This returns the bitwise or of all fuzz test's return values.
 
@@ -620,94 +963,38 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     int rv = 0;
 
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_builtin_float)
-    rv |= _run_fuzz(data, size, fuzz_builtin_float);
+    FUZZ_TARGET_NO_INIT(builtin_float);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_builtin_int)
-    rv |= _run_fuzz(data, size, fuzz_builtin_int);
+    FUZZ_TARGET_NO_INIT(builtin_int);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_builtin_unicode)
-    rv |= _run_fuzz(data, size, fuzz_builtin_unicode);
+    FUZZ_TARGET_NO_INIT(builtin_unicode);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_struct_unpack)
-    static int STRUCT_UNPACK_INITIALIZED = 0;
-    if (!STRUCT_UNPACK_INITIALIZED && !init_struct_unpack()) {
-        PyErr_Print();
-        abort();
-    } else {
-        STRUCT_UNPACK_INITIALIZED = 1;
-    }
-    rv |= _run_fuzz(data, size, fuzz_struct_unpack);
+    FUZZ_TARGET(struct_unpack, init_struct_unpack);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_json_loads)
-    static int JSON_LOADS_INITIALIZED = 0;
-    if (!JSON_LOADS_INITIALIZED && !init_json_loads()) {
-        PyErr_Print();
-        abort();
-    } else {
-        JSON_LOADS_INITIALIZED = 1;
-    }
-
-    rv |= _run_fuzz(data, size, fuzz_json_loads);
+    FUZZ_TARGET(json_loads, init_json_loads);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_sre_compile)
-    static int SRE_COMPILE_INITIALIZED = 0;
-    if (!SRE_COMPILE_INITIALIZED && !init_sre_compile()) {
-        PyErr_Print();
-        abort();
-    } else {
-        SRE_COMPILE_INITIALIZED = 1;
-    }
-
-    if (SRE_COMPILE_INITIALIZED) {
-        rv |= _run_fuzz(data, size, fuzz_sre_compile);
-    }
+    FUZZ_TARGET(sre_compile, init_sre_compile);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_sre_match)
-    static int SRE_MATCH_INITIALIZED = 0;
-    if (!SRE_MATCH_INITIALIZED && !init_sre_match()) {
-        PyErr_Print();
-        abort();
-    } else {
-        SRE_MATCH_INITIALIZED = 1;
-    }
-
-    rv |= _run_fuzz(data, size, fuzz_sre_match);
+    FUZZ_TARGET(sre_match, init_sre_match);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_csv_reader)
-    static int CSV_READER_INITIALIZED = 0;
-    if (!CSV_READER_INITIALIZED && !init_csv_reader()) {
-        PyErr_Print();
-        abort();
-    } else {
-        CSV_READER_INITIALIZED = 1;
-    }
-
-    rv |= _run_fuzz(data, size, fuzz_csv_reader);
+    FUZZ_TARGET(csv_reader, init_csv_reader);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_ast_literal_eval)
-    static int AST_LITERAL_EVAL_INITIALIZED = 0;
-    if (!AST_LITERAL_EVAL_INITIALIZED && !init_ast_literal_eval()) {
-        PyErr_Print();
-        abort();
-    } else {
-        AST_LITERAL_EVAL_INITIALIZED = 1;
-    }
-
-    rv |= _run_fuzz(data, size, fuzz_ast_literal_eval);
+    FUZZ_TARGET(ast_literal_eval, init_ast_literal_eval);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_elementtree_parsewhole)
-    static int ELEMENTTREE_PARSEWHOLE_INITIALIZED = 0;
-    if (!ELEMENTTREE_PARSEWHOLE_INITIALIZED && !init_elementtree_parsewhole()) {
-        PyErr_Print();
-        abort();
-    } else {
-        ELEMENTTREE_PARSEWHOLE_INITIALIZED = 1;
-    }
-
-    rv |= _run_fuzz(data, size, fuzz_elementtree_parsewhole);
+    FUZZ_TARGET(elementtree_parsewhole, init_elementtree_parsewhole);
 #endif
 #if !defined(_Py_FUZZ_ONE) || defined(_Py_FUZZ_fuzz_pycompile)
-    rv |= _run_fuzz(data, size, fuzz_pycompile);
+    FUZZ_TARGET_NO_INIT(pycompile);
 #endif
-  return rv;
+    return rv;
 }
+
